@@ -12,7 +12,6 @@ Usage:
     python train.py --data_root /path/to/data --resume ./checkpoints/latest.pt
 """
 
-import os
 import sys
 import argparse
 import json
@@ -21,7 +20,7 @@ from pathlib import Path
 from datetime import datetime
 
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 # Add parent directory to path for imports
@@ -32,6 +31,7 @@ from model.loss import MeshPerceptualLoss, MeshGeometricLoss
 from trainer import FaceCentricMeshMeanFlowTrainer
 from data.data_loading import (
     FaceCentricMeshDataset,
+    CachedFaceCentricMeshDataset,
     SyntheticFaceCentricMeshDataset,
     create_dataloader,
 )
@@ -52,6 +52,8 @@ def parse_args():
                         help='Override image directory (default: data_root/tiff_kyoto_buf1_2025)')
     parser.add_argument('--footprint_root', type=str, default=None,
                         help='Override footprint directory (default: data_root/geojson_kyoto_2025)')
+    parser.add_argument('--cache_file', type=str, default=None,
+                        help='Path to single .npz cache file (created by data_loading.py --preprocess)')
     parser.add_argument('--synthetic', action='store_true',
                         help='Use synthetic data for testing')
     parser.add_argument('--num_synthetic', type=int, default=1000,
@@ -75,7 +77,7 @@ def parse_args():
     # Training
     parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-4,
+    parser.add_argument('--lr', type=float, default=1e-5,
                         help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.01,
                         help='Weight decay')
@@ -178,9 +180,27 @@ def create_dataloaders(args):
             use_image=use_image,
             seed=123,  # Different seed for val
         )
+    elif args.cache_file is not None:
+        print(f"Using cached data from {args.cache_file}")
+        cache_kwargs = dict(
+            cache_file=args.cache_file,
+            max_faces=args.max_faces,
+            use_footprint=use_footprint,
+            use_image=use_image,
+        )
+        train_dataset = CachedFaceCentricMeshDataset(
+            **cache_kwargs,
+            split='train',
+            augment=True,
+        )
+        val_dataset = CachedFaceCentricMeshDataset(
+            **cache_kwargs,
+            split='val',
+            augment=False,
+        )
     else:
         if args.data_root is None:
-            raise ValueError("--data_root is required when not using --synthetic")
+            raise ValueError("--data_root or --cache_file is required when not using --synthetic")
 
         dataset_kwargs = dict(
             data_root=args.data_root,
@@ -271,11 +291,14 @@ def train_epoch(trainer, train_loader, scheduler, writer, epoch, global_step, ar
         # Logging
         if global_step % args.log_interval == 0:
             lr = scheduler.get_last_lr()[0]
+            avg_loss = epoch_losses['total_loss'] / num_batches
             log_str = f"Epoch {epoch} | Step {global_step} | LR {lr:.2e}"
             for k, v in loss_dict.items():
                 log_str += f" | {k}: {v:.4f}"
                 writer.add_scalar(f'train/{k}', v, global_step)
+            log_str += f" | avg: {avg_loss:.4f}"
             writer.add_scalar('train/lr', lr, global_step)
+            writer.add_scalar('train/avg_loss', avg_loss, global_step)
             print(log_str)
 
     # Average losses
@@ -289,31 +312,24 @@ def validate(trainer, val_loader, writer, epoch, args):
     """Run validation."""
     trainer.model.eval()
 
-    val_losses = {'total_loss': 0, 'velocity_loss': 0}
+    val_losses = {'total_loss': 0, 'x_loss': 0}
     num_batches = 0
 
     for batch in val_loader:
         batch = {k: v.to(args.device) if isinstance(v, torch.Tensor) else v
                  for k, v in batch.items()}
 
-        # Forward pass only (no optimization)
-        face_vertices = batch['face_vertices']  # [B, F, 3, 3]
+        face_vertices = batch['face_vertices']  # [B, F, 3, 3] already in [-1, 1]
         face_mask = batch['face_mask']          # [B, F]
         B, F, _, _ = face_vertices.shape
-
-        # Normalize
-        face_vertices_flat = face_vertices.reshape(B, -1, 3)
-        flat_mask = face_mask.unsqueeze(-1).expand(-1, -1, 3).reshape(B, -1)
-        face_vertices_norm, norm_stats = trainer.normalizer.normalize(face_vertices_flat, flat_mask)
-        face_vertices_norm = face_vertices_norm.reshape(B, F, 3, 3)
 
         # Sample time
         r, t = trainer.sample_time(B, args.device)
 
         # Create noisy vertices
-        epsilon = torch.randn_like(face_vertices_norm)
-        z_t = (1 - t.unsqueeze(-1).unsqueeze(-1)) * face_vertices_norm + t.unsqueeze(-1).unsqueeze(-1) * epsilon
-        v_gt = epsilon - face_vertices_norm
+        epsilon = torch.randn_like(face_vertices)
+        z_t = (1 - t.unsqueeze(-1).unsqueeze(-1)) * face_vertices + t.unsqueeze(-1).unsqueeze(-1) * epsilon
+        v_gt = epsilon - face_vertices
 
         # Prepare conditions
         condition_kwargs = {}
@@ -323,13 +339,14 @@ def validate(trainer, val_loader, writer, epoch, args):
         if 'image' in batch:
             condition_kwargs['image'] = batch['image']
 
-        # Compute loss
-        velocity_loss, _ = trainer.compute_meanflow_loss(
-            trainer.model, z_t, r, t, v_gt, face_mask, condition_kwargs
-        )
+        # x-prediction loss
+        x_pred = trainer.model(z_t, r, t, face_mask, **condition_kwargs)
+        mask = face_mask.unsqueeze(-1).unsqueeze(-1)
+        x_loss = F.mse_loss(x_pred * mask, face_vertices * mask, reduction='sum')
+        x_loss = x_loss / (face_mask.sum() * 3 * 3)
 
-        val_losses['velocity_loss'] += velocity_loss.item()
-        val_losses['total_loss'] += velocity_loss.item()
+        val_losses['x_loss'] = val_losses.get('x_loss', 0) + x_loss.item()
+        val_losses['total_loss'] += x_loss.item()
         num_batches += 1
 
     # Average
@@ -453,7 +470,8 @@ def main():
         )
 
         epoch_time = time.time() - epoch_start_time
-        print(f"Epoch {epoch} completed in {epoch_time:.1f}s")
+        loss_str = " | ".join([f"{k}: {v:.4f}" for k, v in train_losses.items()])
+        print(f"Epoch {epoch} completed in {epoch_time:.1f}s | {loss_str}")
 
         # Validate
         if (epoch + 1) % args.val_interval == 0:

@@ -5,12 +5,11 @@ Provides Dataset and DataLoader implementations for training
 the Mesh MeanFlow model.
 """
 
-import os
 import json
 import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
 try:
@@ -691,10 +690,18 @@ class FaceCentricMeshDataset(Dataset):
         if scale < 1e-6:
             scale = 1.0
         vertices = (vertices - center) / scale
+        # Anchor bottom of building at y = -0.99
+        vertices[:, 1] += -0.99 - vertices[:, 1].min()
         vertices = np.clip(vertices, -1.0, 1.0)
 
         # Convert to face-centric
         face_vertices = vertices[faces]  # [F, 3, 3]
+
+        # Sort faces ascending by centroid: Y first, then X, then Z
+        centroids = face_vertices.mean(axis=1)  # [F, 3]
+        order = np.lexsort((centroids[:, 2], centroids[:, 0], centroids[:, 1]))
+        face_vertices = face_vertices[order]
+
         return face_vertices
 
     def _augment(
@@ -803,6 +810,224 @@ class FaceCentricMeshDataset(Dataset):
         img = torch.from_numpy(img).permute(2, 0, 1)  # [3, H, W]
         return img
 
+    def save_cache(self, cache_file: str, force: bool = False):
+        """
+        Process all samples and write a single .npz cache file.
+
+        The file contains arrays padded to max_faces / max_footprint_points:
+            face_vertices: float32 [N, max_faces, 3, 3]
+            face_mask:     bool    [N, max_faces]
+            footprint:     float32 [N, max_footprint_points, 2]
+            footprint_mask:bool    [N, max_footprint_points]
+            names:         str     [N]
+            images:        uint8   [N, H, W, 3]  (only if use_image=True)
+        """
+        cache_path = Path(cache_file)
+        if cache_path.exists() and not force:
+            print(f"Cache file already exists: {cache_path}  (use force=True to overwrite)")
+            return
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+        N = len(self.samples)
+        print(f"Building single-file cache for {N} samples -> {cache_path}")
+
+        # Pre-allocate arrays
+        all_fv = np.zeros((N, self.max_faces, 3, 3), dtype=np.float32)
+        all_fm = np.zeros((N, self.max_faces), dtype=bool)
+        all_fp = np.zeros((N, self.max_footprint_points, 2), dtype=np.float32)
+        all_fpm = np.zeros((N, self.max_footprint_points), dtype=bool)
+        all_names = np.empty(N, dtype=object)
+
+        if self.use_image:
+            # Determine image size from first successful load
+            img_h, img_w = self.image_size, self.image_size
+            all_images = np.zeros((N, img_h, img_w, 3), dtype=np.uint8)
+
+        errors = []
+        for i, (tile_id, bldg_id, obj_path) in enumerate(self.samples):
+            try:
+                # Mesh
+                mesh = trimesh.load(str(obj_path), force='mesh')
+                fv = self._process_mesh(mesh)  # [F, 3, 3]
+                nf = min(fv.shape[0], self.max_faces)
+                all_fv[i, :nf] = fv[:nf]
+                all_fm[i, :nf] = True
+
+                # Footprint
+                if self.use_footprint:
+                    fp, fp_mask = self._load_footprint(tile_id, bldg_id)
+                    fp_len = int(fp_mask.sum().item())
+                    all_fp[i, :fp_len] = fp[:fp_len].numpy()
+                    all_fpm[i, :fp_len] = True
+
+                # Image
+                if self.use_image:
+                    image = self._load_image(tile_id, bldg_id)
+                    if image is not None:
+                        img_np = (image.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                        all_images[i] = img_np
+
+                all_names[i] = bldg_id
+
+            except Exception as e:
+                errors.append((i, bldg_id, str(e)))
+                all_names[i] = bldg_id if bldg_id else f'error_{i}'
+                print(f"  ERROR [{i+1}/{N}] {bldg_id}: {e}")
+
+            if (i + 1) % 500 == 0 or i == N - 1:
+                print(f"  [{i+1}/{N}] processed, {len(errors)} errors so far")
+
+        # Save single compressed file
+        save_kwargs = {
+            'face_vertices': all_fv,
+            'face_mask': all_fm,
+            'footprint': all_fp,
+            'footprint_mask': all_fpm,
+            'names': np.array(all_names, dtype=str),
+        }
+        if self.use_image:
+            save_kwargs['images'] = all_images
+
+        np.savez_compressed(str(cache_path), **save_kwargs)
+        print(f"Cache saved: {cache_path} ({N} samples, {len(errors)} errors)")
+
+
+class CachedFaceCentricMeshDataset(Dataset):
+    """
+    Fast dataset that reads a single pre-cached .npz file produced by
+    FaceCentricMeshDataset.save_cache() or preprocess_to_cache().
+
+    All arrays are loaded into memory at init for fast __getitem__ indexing.
+    """
+
+    def __init__(
+        self,
+        cache_file: str,
+        max_faces: int = 256,
+        max_footprint_points: int = 64,
+        use_footprint: bool = True,
+        use_image: bool = False,
+        split: str = 'train',
+        split_ratio: Tuple[float, float, float] = (0.8, 0.1, 0.1),
+        seed: int = 42,
+        augment: bool = True,
+    ):
+        super().__init__()
+
+        cache_path = Path(cache_file)
+        if not cache_path.exists():
+            raise FileNotFoundError(f"Cache file not found: {cache_path}")
+
+        self.max_faces = max_faces
+        self.max_footprint_points = max_footprint_points
+        self.use_footprint = use_footprint
+        self.use_image = use_image
+        self.split = split
+        self.augment = augment and (split == 'train')
+
+        # Load all arrays eagerly (mmap_mode cannot be used with .npz archives)
+        npz = np.load(str(cache_path), allow_pickle=False)
+        self.face_vertices = npz['face_vertices']   # [N, max_faces, 3, 3]
+        self.face_mask = npz['face_mask']            # [N, max_faces]
+        self.footprint = npz['footprint']            # [N, max_fp, 2]
+        self.footprint_mask = npz['footprint_mask']  # [N, max_fp]
+        self.names = npz['names']                    # [N]
+        self.images = npz['images'] if 'images' in npz else None
+
+        N = self.face_vertices.shape[0]
+
+        # Split on indices (same logic as FaceCentricMeshDataset)
+        np.random.seed(seed)
+        perm = np.random.permutation(N)
+
+        train_end = int(N * split_ratio[0])
+        val_end = train_end + int(N * split_ratio[1])
+
+        if split == 'train':
+            self.indices = perm[:train_end]
+        elif split == 'val':
+            self.indices = perm[train_end:val_end]
+        else:  # test
+            self.indices = perm[val_end:]
+
+        print(f"CachedFaceCentricMeshDataset [{split}]: {len(self.indices)} samples (from {N} total)")
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        real_idx = int(self.indices[idx])
+
+        # Face vertices — already padded to [max_faces, 3, 3]
+        fv = torch.from_numpy(self.face_vertices[real_idx].copy()).float()
+        fm = torch.from_numpy(self.face_mask[real_idx].copy())
+
+        # Clamp to self.max_faces (in case cache was built with larger max)
+        fv = fv[:self.max_faces]
+        fm = fm[:self.max_faces]
+
+        if self.augment:
+            fv = self._augment(fv, fm)
+
+        name = str(self.names[real_idx])
+
+        batch = {
+            'face_vertices': fv,
+            'face_mask': fm,
+            'name': name,
+        }
+
+        # Footprint
+        if self.use_footprint and self.footprint is not None:
+            fp = torch.from_numpy(self.footprint[real_idx].copy()).float()
+            fpm = torch.from_numpy(self.footprint_mask[real_idx].copy())
+            fp = fp[:self.max_footprint_points]
+            fpm = fpm[:self.max_footprint_points]
+            batch['footprint'] = fp
+            batch['footprint_mask'] = fpm
+
+        # Image
+        if self.use_image and self.images is not None:
+            img = self.images[real_idx].copy()
+            img = img.astype(np.float32) / 255.0
+            img = torch.from_numpy(img).permute(2, 0, 1)  # [3, H, W]
+            batch['image'] = img
+
+        return batch
+
+    def _augment(
+        self,
+        face_vertices: torch.Tensor,
+        face_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply random augmentation to face-centric mesh."""
+        F, V_per_face, coords = face_vertices.shape
+        flat = face_vertices.reshape(-1, 3)
+        flat_mask = face_mask.unsqueeze(-1).expand(-1, 3).reshape(-1)
+
+        if np.random.rand() < 0.5:
+            angle = np.random.uniform(0, 2 * np.pi)
+            cos_a, sin_a = np.cos(angle), np.sin(angle)
+            rot_matrix = torch.tensor([
+                [cos_a, 0, sin_a],
+                [0, 1, 0],
+                [-sin_a, 0, cos_a]
+            ], dtype=flat.dtype)
+            flat[flat_mask] = flat[flat_mask] @ rot_matrix.T
+
+        if np.random.rand() < 0.5:
+            scale = np.random.uniform(0.8, 1.2)
+            flat[flat_mask] = flat[flat_mask] * scale
+
+        if np.random.rand() < 0.5:
+            flat[flat_mask, 0] = -flat[flat_mask, 0]
+            face_vertices = flat.reshape(F, V_per_face, coords)
+            face_vertices = face_vertices[:, [0, 2, 1], :]
+            return face_vertices
+
+        return flat.reshape(F, V_per_face, coords)
+
 
 class SyntheticFaceCentricMeshDataset(Dataset):
     """
@@ -909,3 +1134,238 @@ class SyntheticFaceCentricMeshDataset(Dataset):
             batch['image'] = torch.randn(3, 224, 224)
 
         return batch
+
+
+# ============================================================================
+# Standalone Preprocessing
+# ============================================================================
+
+
+def preprocess_to_cache(
+    data_root: str,
+    cache_file: str,
+    max_faces: int = 256,
+    max_footprint_points: int = 64,
+    use_footprint: bool = True,
+    use_image: bool = False,
+    image_size: int = 224,
+    force: bool = False,
+):
+    """
+    Preprocess all OBJ + GeoJSON + TIFF data into a single .npz cache file.
+
+    This creates the full dataset (no train/val/test split) so that
+    CachedFaceCentricMeshDataset can split at load time.
+
+    Args:
+        data_root: Root directory containing obj/geojson/tiff subdirs
+        cache_file: Output .npz file path
+        max_faces: Maximum faces per mesh (used for simplification)
+        max_footprint_points: Maximum footprint polygon points
+        use_footprint: Whether to include footprint data
+        use_image: Whether to include image data
+        image_size: Size to resize conditioning images
+        force: Re-process even if cache file already exists
+    """
+    if not TRIMESH_AVAILABLE:
+        raise ImportError("trimesh is required. Install with: pip install trimesh")
+
+    data_root = Path(data_root)
+    cache_path = Path(cache_file)
+
+    if cache_path.exists() and not force:
+        print(f"Cache file already exists: {cache_path}  (use --force to overwrite)")
+        return
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    mesh_root = data_root / 'obj_unlabeled_2025' / '100k' / '2022' / 'kyoto'
+    image_root = data_root / 'tiff_kyoto_buf1_2025'
+    footprint_root = data_root / 'geojson_kyoto_2025'
+
+    # Build sample index
+    samples = []
+    for tile_dir in sorted(mesh_root.iterdir()):
+        if not tile_dir.is_dir():
+            continue
+        tile_id = tile_dir.name
+        for obj_file in sorted(tile_dir.glob('*.obj')):
+            bldg_id = obj_file.stem
+            samples.append((tile_id, bldg_id, obj_file))
+
+    N = len(samples)
+    print(f"Found {N} OBJ files in {mesh_root}")
+
+    # Pre-load footprint geojsons
+    footprint_cache = {}
+    if use_footprint and footprint_root.exists():
+        for geojson_file in sorted(footprint_root.glob('*.geojson')):
+            tile_id = geojson_file.stem
+            with open(geojson_file, 'r') as f:
+                data = json.load(f)
+            tile_cache = {}
+            for feature in data.get('features', []):
+                bid = feature['properties'].get('id', '')
+                tile_cache[bid] = feature
+            footprint_cache[tile_id] = tile_cache
+        print(f"Loaded footprints for {len(footprint_cache)} tiles")
+
+    # Pre-allocate arrays
+    all_fv = np.zeros((N, max_faces, 3, 3), dtype=np.float32)
+    all_fm = np.zeros((N, max_faces), dtype=bool)
+    all_fp = np.zeros((N, max_footprint_points, 2), dtype=np.float32)
+    all_fpm = np.zeros((N, max_footprint_points), dtype=bool)
+    all_names = np.empty(N, dtype=object)
+
+    if use_image and PIL_AVAILABLE:
+        all_images = np.zeros((N, image_size, image_size, 3), dtype=np.uint8)
+
+    error_list = []
+
+    for i, (tile_id, bldg_id, obj_path) in enumerate(samples):
+        try:
+            mesh = trimesh.load(str(obj_path), force='mesh')
+            vertices = np.array(mesh.vertices, dtype=np.float32)
+            faces = np.array(mesh.faces, dtype=np.int64)
+
+            # Simplify if needed
+            if len(faces) > max_faces:
+                try:
+                    mesh = mesh.simplify_quadric_decimation(max_faces)
+                    vertices = np.array(mesh.vertices, dtype=np.float32)
+                    faces = np.array(mesh.faces, dtype=np.int64)
+                except Exception:
+                    faces = faces[:max_faces]
+
+            # Normalize to [-1, 1]
+            v_min = vertices.min(axis=0)
+            v_max = vertices.max(axis=0)
+            center = (v_min + v_max) / 2
+            scale = (v_max - v_min).max() / 2
+            if scale < 1e-6:
+                scale = 1.0
+            vertices = (vertices - center) / scale
+            # Anchor bottom of building at y = -0.99
+            vertices[:, 1] += -0.99 - vertices[:, 1].min()
+            vertices = np.clip(vertices, -1.0, 1.0)
+
+            face_vertices = vertices[faces]  # [F, 3, 3]
+
+            # Sort faces ascending by centroid: Y first, then X, then Z
+            centroids = face_vertices.mean(axis=1)  # [F, 3]
+            order = np.lexsort((centroids[:, 2], centroids[:, 0], centroids[:, 1]))
+            face_vertices = face_vertices[order]
+
+            nf = min(face_vertices.shape[0], max_faces)
+            all_fv[i, :nf] = face_vertices[:nf].astype(np.float32)
+            all_fm[i, :nf] = True
+
+            # Footprint
+            if use_footprint:
+                fp_points = _extract_footprint(footprint_cache, tile_id, bldg_id)
+                if fp_points is not None:
+                    np_fp = min(len(fp_points), max_footprint_points)
+                    all_fp[i, :np_fp] = fp_points[:np_fp].astype(np.float32)
+                    all_fpm[i, :np_fp] = True
+
+            # Image
+            if use_image and PIL_AVAILABLE and image_root.exists():
+                img_path = image_root / tile_id / f'{bldg_id}.tif'
+                if img_path.exists():
+                    img = Image.open(img_path).convert('RGB')
+                    img = img.resize((image_size, image_size), Image.BILINEAR)
+                    all_images[i] = np.array(img, dtype=np.uint8)
+
+            all_names[i] = bldg_id
+
+        except Exception as e:
+            error_list.append((i, bldg_id, str(e)))
+            all_names[i] = bldg_id if bldg_id else f'error_{i}'
+            print(f"  ERROR [{i+1}/{N}] {bldg_id}: {e}")
+
+        if (i + 1) % 500 == 0 or i == N - 1:
+            print(f"  [{i+1}/{N}] processed, {len(error_list)} errors so far")
+
+    # Save single compressed file
+    save_kwargs = {
+        'face_vertices': all_fv,
+        'face_mask': all_fm,
+        'footprint': all_fp,
+        'footprint_mask': all_fpm,
+        'names': np.array(all_names, dtype=str),
+    }
+    if use_image and PIL_AVAILABLE:
+        save_kwargs['images'] = all_images
+
+    np.savez_compressed(str(cache_path), **save_kwargs)
+    print(f"Preprocessing complete: {cache_path} ({N} samples, {len(error_list)} errors)")
+
+
+def _extract_footprint(
+    footprint_cache: dict, tile_id: str, bldg_id: str
+) -> Optional[np.ndarray]:
+    """Extract and normalize footprint polygon from cached geojson data."""
+    tile_cache = footprint_cache.get(tile_id, {})
+    feature = tile_cache.get(bldg_id)
+
+    if feature is None:
+        return None
+
+    geometry = feature.get('geometry', {})
+    coords_list = geometry.get('coordinates', [])
+
+    if len(coords_list) == 0:
+        return None
+
+    ring = coords_list[0][0]
+    points = np.array(ring, dtype=np.float64)
+
+    if len(points) > 1 and np.allclose(points[0], points[-1]):
+        points = points[:-1]
+
+    if len(points) == 0:
+        return None
+
+    points_2d = points[:, :2].astype(np.float32)
+    points_2d = points_2d - points_2d.mean(axis=0, keepdims=True)
+    max_extent = np.abs(points_2d).max()
+    if max_extent > 0:
+        points_2d = points_2d / max_extent
+
+    return points_2d
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='BldgMF data preprocessing')
+    parser.add_argument('--preprocess', action='store_true',
+                        help='Run preprocessing to create single .npz cache')
+    parser.add_argument('--data_root', type=str, default='../BldgMF_data',
+                        help='Root data directory')
+    parser.add_argument('--cache_file', type=str, default='../BldgMF_data/cache.npz',
+                        help='Output cache .npz file path')
+    parser.add_argument('--max_faces', type=int, default=256,
+                        help='Maximum faces per mesh')
+    parser.add_argument('--max_footprint_points', type=int, default=64,
+                        help='Maximum footprint polygon points')
+    parser.add_argument('--use_footprint', action='store_true', default=True,
+                        help='Include footprint data')
+    parser.add_argument('--use_image', action='store_true', default=True,
+                        help='Include image data')
+    parser.add_argument('--force', action='store_true', default=False,
+                        help='Re-process even if cache exists')
+    args = parser.parse_args()
+
+    if args.preprocess:
+        preprocess_to_cache(
+            data_root=args.data_root,
+            cache_file=args.cache_file,
+            max_faces=args.max_faces,
+            max_footprint_points=args.max_footprint_points,
+            use_footprint=args.use_footprint,
+            use_image=args.use_image,
+            force=args.force,
+        )
+    else:
+        parser.print_help()

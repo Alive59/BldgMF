@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as nnf
 from torch.func import jvp
 from typing import Tuple, Dict
 
@@ -54,7 +54,7 @@ class MeshMeanFlowTrainer:
         else:
             raise ValueError(f"Unknown noise schedule: {self.noise_schedule}")
         
-        t = t.clamp(1e-5, 1 - 1e-5)
+        t = t.clamp(0.01, 1 - 1e-5)
         
         # Sample r
         # With probability (1 - r_ratio), r = t (Flow Matching mode)
@@ -116,7 +116,7 @@ class MeshMeanFlowTrainer:
         V = u + (t - r).unsqueeze(-1) * dudt.detach()
         
         # MSE loss in velocity space
-        loss = F.mse_loss(V, v_gt, reduction='none')
+        loss = nnf.mse_loss(V, v_gt, reduction='none')
         
         # Mask invalid vertices
         loss = loss * vertex_mask.unsqueeze(-1)
@@ -160,7 +160,7 @@ class MeshMeanFlowTrainer:
         V = u + (t - r).unsqueeze(-1) * dudt.detach()
         
         # Loss
-        loss = F.mse_loss(V, v_gt, reduction='none')
+        loss = nnf.mse_loss(V, v_gt, reduction='none')
         loss = loss * vertex_mask.unsqueeze(-1)
         loss = loss.sum() / vertex_mask.sum() / 3
         
@@ -310,6 +310,7 @@ class FaceCentricMeshMeanFlowTrainer:
         geometric_loss: nn.Module = None,
         lambda_perceptual: float = 0.4,
         lambda_geometric: float = 0.1,
+        lambda_meanflow: float = 0.1,
         noise_schedule: str = 'logit_normal',
         r_ratio: float = 0.5,
     ):
@@ -319,6 +320,7 @@ class FaceCentricMeshMeanFlowTrainer:
         self.geometric_loss = geometric_loss
         self.lambda_perceptual = lambda_perceptual
         self.lambda_geometric = lambda_geometric
+        self.lambda_meanflow = lambda_meanflow
         self.noise_schedule = noise_schedule
         self.r_ratio = r_ratio
 
@@ -334,7 +336,7 @@ class FaceCentricMeshMeanFlowTrainer:
         else:
             raise ValueError(f"Unknown noise schedule: {self.noise_schedule}")
 
-        t = t.clamp(1e-5, 1 - 1e-5)
+        t = t.clamp(0.01, 1 - 1e-5)
 
         use_interval = torch.rand(batch_size, device=device) < self.r_ratio
         r_uniform = t * torch.rand(batch_size, device=device)
@@ -365,33 +367,26 @@ class FaceCentricMeshMeanFlowTrainer:
     def compute_meanflow_loss(
         self,
         model: FaceCentricMeshMeanFlowNet,
+        x_pred: torch.Tensor,
         z_t: torch.Tensor,
         r: torch.Tensor,
         t: torch.Tensor,
         v_gt: torch.Tensor,
         face_mask: torch.Tensor,
         condition_kwargs: Dict,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
-        Compute MeanFlow loss for face-centric representation.
+        Compute MeanFlow compound velocity loss (one-step capability).
 
-        Args:
-            z_t: [B, F, 3, 3] noisy face vertices
-            r: [B, 1] start time
-            t: [B, 1] end time
-            v_gt: [B, F, 3, 3] ground truth velocity
-            face_mask: [B, F] valid face mask
-            condition_kwargs: additional condition inputs
+        Reuses x_pred from the caller to avoid a redundant forward pass.
+        Only the second forward pass (at t+eps) is done here.
         """
-        # Get x prediction
-        x_pred = model(z_t, r, t, face_mask, **condition_kwargs)
-
         # Convert to u
         u = self.u_from_x(z_t, t, x_pred)
 
-        # Compute du/dt via finite difference
-        eps = 1e-4
-        t_plus = t + eps
+        # Compute du/dt via finite difference (only needs one extra forward pass)
+        eps = 1e-2
+        t_plus = (t + eps).clamp(max=1 - 1e-5)
         x_plus = model(z_t, r, t_plus, face_mask, **condition_kwargs)
         u_plus = self.u_from_x(z_t, t_plus, x_plus)
 
@@ -401,15 +396,15 @@ class FaceCentricMeshMeanFlowTrainer:
         # IMPORTANT: Stop gradient on du/dt
         V = u + (t - r).unsqueeze(-1).unsqueeze(-1) * dudt.detach()
 
-        # MSE loss in velocity space
-        loss = F.mse_loss(V, v_gt, reduction='none')
+        # MSE loss in velocity space, per-element then mask
+        loss = nnf.mse_loss(V, v_gt, reduction='none')
 
-        # Mask invalid faces: [B, F] -> [B, F, 1, 1]
         mask = face_mask.unsqueeze(-1).unsqueeze(-1)
         loss = loss * mask
-        loss = loss.sum() / (face_mask.sum() * 3 * 3)  # Normalize by valid elements
+        loss = loss.clamp(max=100.0)
+        loss = loss.sum() / (face_mask.sum() * 3 * 3)
 
-        return loss, x_pred
+        return loss
 
     def training_step(self, batch: Dict) -> Dict[str, torch.Tensor]:
         """
@@ -448,13 +443,22 @@ class FaceCentricMeshMeanFlowTrainer:
         if 'image' in batch:
             condition_kwargs['image'] = batch['image']
 
-        # Compute MeanFlow loss
-        velocity_loss, x_pred = self.compute_meanflow_loss(
-            self.model, z_t, r, t, v_gt, face_mask, condition_kwargs
+        # ---- x-prediction loss (stable anchor) ----
+        x_pred = self.model(z_t, r, t, face_mask, **condition_kwargs)
+        mask = face_mask.unsqueeze(-1).unsqueeze(-1)  # [B, F, 1, 1]
+        x_loss = nnf.mse_loss(x_pred * mask, face_vertices * mask, reduction='sum')
+        x_loss = x_loss / (face_mask.sum() * 3 * 3)
+
+        # ---- MeanFlow velocity loss (one-step capability) ----
+        velocity_loss = self.compute_meanflow_loss(
+            self.model, x_pred, z_t, r, t, v_gt, face_mask, condition_kwargs
         )
 
-        total_loss = velocity_loss
-        loss_dict = {'velocity_loss': velocity_loss.item()}
+        total_loss = x_loss + self.lambda_meanflow * velocity_loss
+        loss_dict = {
+            'x_loss': x_loss.item(),
+            'velocity_loss': velocity_loss.item(),
+        }
 
         # Perceptual loss (when noise is low)
         if self.perceptual_loss is not None:

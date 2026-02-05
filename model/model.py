@@ -230,9 +230,11 @@ class MeshCrossAttentionBlock(nn.Module):
         
         return x + out
     
-    
+
 class MeshMeanFlowNet(nn.Module):
     """
+    DEPRECATED: Use FaceCentricMeshMeanFlowNet instead.
+
     Complete Mesh MeanFlow network for x-prediction (vertex-indexed version).
 
     Key design: Network outputs denoised vertex positions directly.
@@ -246,7 +248,7 @@ class MeshMeanFlowNet(nn.Module):
         num_heads: int = 8,
         condition_type: str = 'footprint',  # 'footprint', 'image', 'both'
         footprint_dim: int = 64,
-        image_encoder: str = 'dinov2',
+        image_encoder: str = 'clip',
         dropout: float = 0.0,
     ):
         super().__init__()
@@ -470,14 +472,12 @@ class MeshMeanFlowNet(nn.Module):
         edge_index = edge_index.unsqueeze(0).expand(B, -1, -1)
 
         # ========== Transformer Blocks ==========
-        block_idx = 0
         for block in self.blocks:
             if isinstance(block, MeshAttentionBlock):
                 h = block(h, cond, edge_index, vertex_mask)
             elif isinstance(block, MeshCrossAttentionBlock):
                 if context is not None:
                     h = block(h, context, cond, context_mask)
-            block_idx += 1
 
         # ========== Output Head ==========
         h = self.output_norm(h)
@@ -513,7 +513,7 @@ class FaceCentricMeshMeanFlowNet(nn.Module):
         num_heads: int = 8,
         condition_type: str = 'footprint',  # 'footprint', 'image', 'both', 'none'
         footprint_dim: int = 64,
-        image_encoder: str = 'dinov2',
+        image_encoder: str = 'clip',
         dropout: float = 0.0,
     ):
         super().__init__()
@@ -671,10 +671,7 @@ class FaceCentricMeshMeanFlowNet(nn.Module):
         face_pos = face_pos.reshape(1, F * 3, -1)  # [1, F*3, hidden]
         h = h + face_pos
 
-        # Add vertex-in-face embedding (0, 1, 2 pattern repeated F times)
-        vif_pos = self.vertex_in_face_embed.expand(-1, F, -1)  # [1, 3, hidden] -> broadcast
-        vif_pos = self.vertex_in_face_embed.repeat(1, F, 1)  # [1, F*3, hidden] but wrong pattern
-        # Correct pattern: [v0, v1, v2, v0, v1, v2, ...]
+        # Add vertex-in-face embedding: [v0, v1, v2, v0, v1, v2, ...] repeated F times
         vif_pos = self.vertex_in_face_embed.expand(F, -1, -1).reshape(1, F * 3, -1)  # [1, F*3, hidden]
         h = h + vif_pos
 
@@ -686,7 +683,7 @@ class FaceCentricMeshMeanFlowNet(nn.Module):
         # ========== Encode Conditions ==========
         context = None
         context_mask = None
-
+        
         if self.condition_type in ['footprint', 'both'] and footprint is not None:
             fp_feat = self.footprint_encoder(footprint, footprint_mask)  # [B, P, hidden]
             context = fp_feat
@@ -768,39 +765,66 @@ class FootprintEncoder(nn.Module):
 
 class ImageConditionEncoder(nn.Module):
     """Encode conditioning image (satellite, etc.)."""
-    
+
     def __init__(self, encoder_type: str = 'dinov2', output_dim: int = 512):
         super().__init__()
-        
+        self.encoder_type = encoder_type
+
         if encoder_type == 'dinov2':
             self.encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
             encoder_dim = 768
         elif encoder_type == 'clip':
             import clip
-            self.encoder, _ = clip.load('ViT-B/32')
+            self.encoder, _ = clip.load('ViT-B/32', device='cpu')
+            self.encoder = self.encoder.float()
+            # CLIP ViT-B/32: 768 internal dim, projected to 512 via visual.proj
+            # We use the 512-d projected patch tokens
             encoder_dim = 512
         else:
             raise ValueError(f"Unknown encoder: {encoder_type}")
-        
+
         # Freeze encoder
         for param in self.encoder.parameters():
             param.requires_grad = False
-        
+
         self.proj = nn.Linear(encoder_dim, output_dim)
-        
+
+    def _clip_patch_features(self, image: torch.Tensor) -> torch.Tensor:
+        """Extract [B, num_patches, 512] from CLIP visual encoder."""
+        v = self.encoder.visual
+        x = v.conv1(image)                          # [B, 768, grid, grid]
+        x = x.reshape(x.shape[0], x.shape[1], -1)   # [B, 768, grid**2]
+        x = x.permute(0, 2, 1)                       # [B, grid**2, 768]
+        cls = v.class_embedding.to(x.dtype) + torch.zeros(
+            x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device)
+        x = torch.cat([cls, x], dim=1)               # [B, grid**2+1, 768]
+        x = x + v.positional_embedding.to(x.dtype)
+        x = v.ln_pre(x)
+        x = x.permute(1, 0, 2)                       # LND
+        x = v.transformer(x)
+        x = x.permute(1, 0, 2)                       # NLD
+        # Apply ln_post and projection to ALL tokens, then drop CLS
+        x = v.ln_post(x)
+        if v.proj is not None:
+            x = x @ v.proj                            # [B, grid**2+1, 512]
+        return x[:, 1:, :]                            # [B, grid**2, 512]
+
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """
         Args:
             image: [B, 3, H, W]
-            
+
         Returns:
             features: [B, L, output_dim]
         """
         with torch.no_grad():
-            # Get patch features (not just CLS token)
-            features = self.encoder.forward_features(image)
-            if isinstance(features, dict):
-                features = features['x_norm_patchtokens']
-        
+            if self.encoder_type == 'clip':
+                features = self._clip_patch_features(image)
+            else:
+                # DINOv2 path
+                features = self.encoder.forward_features(image)
+                if isinstance(features, dict):
+                    features = features['x_norm_patchtokens']
+
         features = self.proj(features)
         return features
